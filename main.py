@@ -1,88 +1,100 @@
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, BackgroundTasks, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-import time
-from music_gen import generate_music, is_paused_flag, pause_condition
-from firebase import upload_to_firebase
+from fastapi.middleware.cors import CORSMiddleware
+from music_loop import generate_and_upload_loop, generate_music, upload_to_firebase
+import threading
 
-app = FastAPI(title="Xenotune AI Music Generator")
+app = FastAPI()
 
-# --- CORS ---
+# Allow CORS for local dev or frontend integration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Update in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"]
+    allow_headers=["*"],
 )
 
-# --- Valid Modes ---
-VALID_MODES = {"focus", "relax", "sleep"}
+# Global shared state
+music_state = {
+    "mode": "focus",
+    "user_id": None,
+    "current_slot": "M1",  # M1 or M2
+    "replace_requested": False,
+}
 
-# --- Request Model ---
-class GenerateMusicRequest(BaseModel):
-    user_id: str
-    mode: str
+stop_flag = {"value": False}
+thread = None
 
-# --- Generate Music Endpoint ---
 @app.post("/generate")
-async def handle_music_generation(request: GenerateMusicRequest):
-    mode = request.mode.lower().strip()
-    user_id = request.user_id.strip()
+async def generate_music_endpoint(request: Request, background_tasks: BackgroundTasks):
+    """
+    Starts music generation loop for a given user and mode.
+    Uploads M1.mp3 to Firebase initially.
+    """
+    global thread, stop_flag, music_state
 
-    if mode not in VALID_MODES:
-        return JSONResponse(
-            content={"error": "Invalid mode. Choose from focus, relax, or sleep."},
-            status_code=400
-        )
+    payload = await request.json()
+    user_id = payload.get("user_id")
+    mode = payload.get("mode", "focus")
+
     if not user_id:
-        return JSONResponse(content={"error": "User ID is required."}, status_code=400)
+        return JSONResponse(content={"error": "user_id is required"}, status_code=400)
 
-    try:
-        timestamp = int(time.time())
-        filename = f"{mode}_{timestamp}.mp3"
+    # Update shared state
+    music_state["user_id"] = user_id
+    music_state["mode"] = mode
+    music_state["current_slot"] = "M1"
+    music_state["replace_requested"] = False
+    stop_flag["value"] = False
 
-        # Generate music
-        local_path = generate_music(mode)
-        if not local_path:
-            return JSONResponse(content={"error": "Music generation failed."}, status_code=500)
+    # Generate and upload M1.mp3 immediately
+    local_path = generate_music(mode)
+    if not local_path:
+        return JSONResponse(content={"error": "Music generation failed."}, status_code=500)
 
-        # Upload to Firebase
-        firebase_path = f"users/{user_id}/{filename}"
-        download_url = upload_to_firebase(local_path, firebase_path)
+    firebase_path = f"users/{user_id}/M1.mp3"
+    download_url = upload_to_firebase(local_path, firebase_path)
 
-        return {
-            "status": "success",
-            "mode": mode,
-            "filename": filename,
-            "download_url": download_url,
-            "message": f"{mode.capitalize()} music generated and uploaded."
-        }
+    # Start background loop to handle replacements
+    def run_loop():
+        generate_and_upload_loop(music_state, stop_flag)
 
-    except Exception as e:
-        return JSONResponse(
-            content={"error": f"Server error: {str(e)}"},
-            status_code=500
-        )
+    thread = threading.Thread(target=run_loop)
+    thread.start()
 
-# --- Health Check ---
-@app.get("/", summary="Xenotune API Health")
-def health_check():
-    return {"message": "🎶 Xenotune backend is alive and ready to generate music!"}
+    return {
+        "status": "success",
+        "mode": mode,
+        "download_url": download_url,
+        "message": f"{mode.capitalize()} music generated and uploaded as M1.mp3."
+    }
 
-# --- Pause Music Generation ---
-@app.post("/pause")
-def pause_generation():
-    is_paused_flag["value"] = True
-    with pause_condition:
-        pause_condition.notify_all()
-    return {"status": "paused"}
+@app.post("/replace")
+async def replace_music():
+    """
+    Signals the music loop to regenerate the inactive slot.
+    """
+    if not music_state["user_id"]:
+        return JSONResponse(content={"error": "Music not started. Call /generate first."}, status_code=400)
 
-# --- Resume Music Generation ---
-@app.post("/resume")
-def resume_generation():
-    is_paused_flag["value"] = False
-    with pause_condition:
-        pause_condition.notify_all()
-    return {"status": "resumed"}
+    music_state["replace_requested"] = True
+
+    return {
+        "status": "queued",
+        "message": f"Replacement requested. Will generate the next inactive slot (currently playing {music_state['current_slot']})."
+    }
+
+@app.post("/stop")
+async def stop_music():
+    """
+    Stops the music loop and background thread.
+    """
+    global thread
+    stop_flag["value"] = True
+    music_state["replace_requested"] = False
+
+    if thread and thread.is_alive():
+        thread.join()
+
+    return {"status": "stopped", "message": "Music generation loop has been stopped."}

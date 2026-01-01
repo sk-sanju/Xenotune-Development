@@ -10,8 +10,10 @@ def gm_instrument(program):
 # --- Paths ---
 CONFIG_PATH = "config.json"
 OUTPUT_PATH = "output"
-FFMPEG_PATH = os.path.join("ffmpeg", "bin", "ffmpeg.exe")
-FLUIDSYNTH_PATH = os.path.join("fluidsynth", "bin", "fluidsynth.exe")
+# FFMPEG_PATH = os.path.join("ffmpeg", "bin", "ffmpeg.exe")
+# FLUIDSYNTH_PATH = os.path.join("fluidsynth", "bin", "fluidsynth.exe")
+FFMPEG_PATH = "ffmpeg"
+FLUIDSYNTH_PATH = "fluidsynth"
 SOUNDFONT_PATH = os.path.join("FluidR3_GM", "FluidR3_GM.sf2")
 #BGM_PATH = os.path.join("assets", "bgm.mp3")
 
@@ -206,20 +208,3 @@ def generate_music(mode):
     mf.close()
 
     return convert_midi_to_mp3(midi_path)
-
-pause_condition = threading.Condition()
-is_paused_flag = {"value": False}
-
-def wait_with_pause(duration, stop_flag, pause_condition, is_paused_flag):
-    waited = 0
-    interval = 0.5
-    while waited < duration:
-        with pause_condition:
-            if stop_flag["value"]:
-                print("⏹️ Stop signal received.")
-                break
-            while is_paused_flag["value"]:
-                print("⏸️ Paused... waiting to resume.")
-                pause_condition.wait()
-        time.sleep(interval)
-        waited += interval
